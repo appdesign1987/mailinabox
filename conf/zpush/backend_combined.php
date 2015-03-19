@@ -13,12 +13,7 @@ class BackendCombinedConfig {
 				'i' => array(
 					'name' => 'BackendIMAP',
 				),
-				'c' => array(
-					'name' => 'BackendCalDAV',
-				),
-				'd' => array(
-					'name' => 'BackendCardDAV',
-				),
+				
 			),
 			'delimiter' => '/',
 			'folderbackend' => array(
