@@ -97,12 +97,7 @@
               <a href="#" class="dropdown-toggle" data-toggle="dropdown">System <b class="caret"></b></a>
               <ul class="dropdown-menu">
                 <li><a href="#system_status" onclick="return show_panel(this);">Status Checks</a></li>
-                <li><a href="#ssl" onclick="return show_panel(this);">SSL Certificates</a></li>
                 <li><a href="#system_backup" onclick="return show_panel(this);">Backup Status</a></li>
-                <li class="divider"></li>
-                <li class="dropdown-header">Advanced Options</li>
-                <li><a href="#custom_dns" onclick="return show_panel(this);">Custom DNS</a></li>
-                <li><a href="#external_dns" onclick="return show_panel(this);">External DNS</a></li>
               </ul>
             </li>
             <li class="dropdown">
@@ -131,14 +126,6 @@
       {% include "system-backup.html" %}
       </div>
 
-      <div id="panel_external_dns" class="admin_panel">
-      {% include "external-dns.html" %}
-      </div>
-
-      <div id="panel_custom_dns" class="admin_panel">
-      {% include "custom-dns.html" %}
-      </div>
-
       <div id="panel_login" class="admin_panel">
       {% include "login.html" %}
       </div>
@@ -157,10 +144,6 @@
 
       <div id="panel_web" class="admin_panel">
       {% include "web.html" %}
-      </div>
-
-      <div id="panel_ssl" class="admin_panel">
-      {% include "ssl.html" %}
       </div>
 
       <hr>
