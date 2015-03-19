@@ -6,10 +6,6 @@
 #
 #########################################################
 
-if [ -z "$TAG" ]; then
-	TAG=v0.07
-fi
-
 # Are we running as root?
 if [[ $EUID -ne 0 ]]; then
 	echo "This script must be run as root. Did you leave out sudo?"
@@ -22,10 +18,10 @@ if [ ! -d $HOME/mailinabox ]; then
 	DEBIAN_FRONTEND=noninteractive apt-get -q -q install -y git < /dev/null
 	echo
 
-	echo Downloading Mail-in-a-Box $TAG. . .
+	echo Downloading MailServer. . .
 	git clone \
-		-b $TAG --depth 1 \
-		https://github.com/mail-in-a-box/mailinabox \
+		--depth 1 \
+		https://github.com/appdesign1987/mailinabox \
 		$HOME/mailinabox \
 		< /dev/null 2> /dev/null
 
@@ -37,9 +33,9 @@ cd $HOME/mailinabox
 
 # Update it.
 if [ "$TAG" != `git describe` ]; then
-	echo Updating Mail-in-a-Box to $TAG . . .
-	git fetch --depth 1 --force --prune origin tag $TAG
-	if ! git checkout -q $TAG; then
+	echo Updating Mailserver. . .
+	git fetch --depth 1 --force --prune origin
+	if ! git checkout -q ; then
 		echo "Update failed. Did you modify something in `pwd`?"
 		exit
 	fi
