@@ -130,7 +130,6 @@ EOF
 # Start service configuration.
 source setup/system.sh
 source setup/ssl.sh
-source setup/dns.sh
 source setup/mail-postfix.sh
 source setup/mail-dovecot.sh
 source setup/mail-users.sh
@@ -146,7 +145,6 @@ while [ ! -f /var/lib/mailinabox/api.key ]; do
 	echo Waiting for the Mail-in-a-Box management daemon to start...
 	sleep 2
 done
-tools/dns_update
 tools/web_update
 
 # If there aren't any mail users yet, create one.
