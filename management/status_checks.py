@@ -8,9 +8,10 @@ __ALL__ = ['check_certificate']
 
 import os, os.path, re, subprocess, datetime, multiprocessing.pool
 
-
+import dns.reversename, dns.resolver
 import dateutil.parser, dateutil.tz
 
+from dns_update import get_dns_zones, build_tlsa_record, get_custom_dns_config
 from web_update import get_web_domains, get_domain_ssl_files
 from mailconfig import get_mail_domains, get_mail_aliases
 
@@ -54,9 +55,9 @@ def run_services_checks(env, output, pool):
 	# Check that system services are running.
 
 	services = [
-		
-		
-		
+		{ "name": "Local DNS (bind9)", "port": 53, "public": False, },
+		#{ "name": "NSD Control", "port": 8952, "public": False, },
+		{ "name": "Local DNS Control (bind9/rndc)", "port": 953, "public": False, },
 		{ "name": "Dovecot LMTP LDA", "port": 10026, "public": False, },
 		{ "name": "Postgrey", "port": 10023, "public": False, },
 		{ "name": "Spamassassin", "port": 10025, "public": False, },
@@ -67,10 +68,10 @@ def run_services_checks(env, output, pool):
 		{ "name": "Mail-in-a-Box Management Daemon", "port": 10222, "public": False, },
 
 		{ "name": "SSH Login (ssh)", "port": get_ssh_port(), "public": True, },
-	
+		{ "name": "Public DNS (nsd4)", "port": 53, "public": True, },
 		{ "name": "Incoming Mail (SMTP/postfix)", "port": 25, "public": True, },
 		{ "name": "Outgoing Mail (SMTP 587/postfix)", "port": 587, "public": True, },
-		
+		#{ "name": "Postfix/master", "port": 10587, "public": True, },
 		{ "name": "IMAPS (dovecot)", "port": 993, "public": True, },
 		{ "name": "HTTP Web (nginx)", "port": 80, "public": True, },
 		{ "name": "HTTPS Web (nginx)", "port": 443, "public": True, },
@@ -214,7 +215,109 @@ def run_network_checks(env, output):
 			which may prevent recipients from receiving your email. See http://www.spamhaus.org/query/ip/%s."""
 			% (env['PUBLIC_IP'], zen, env['PUBLIC_IP']))
 
+def run_domain_checks(env, output, pool):
+	# Get the list of domains we handle mail for.
+	mail_domains = get_mail_domains(env)
 
+	# Get the list of domains we serve DNS zones for (i.e. does not include subdomains).
+	dns_zonefiles = dict(get_dns_zones(env))
+	dns_domains = set(dns_zonefiles)
+
+	# Get the list of domains we serve HTTPS for.
+	web_domains = set(get_web_domains(env))
+
+	domains_to_check = mail_domains | dns_domains | web_domains
+
+	# Serial version:
+	#for domain in sort_domains(domains_to_check, env):
+	#	run_domain_checks_on_domain(domain, env, dns_domains, dns_zonefiles, mail_domains, web_domains)
+
+	# Parallelize the checks across a worker pool.
+	args = ((domain, env, dns_domains, dns_zonefiles, mail_domains, web_domains)
+		for domain in domains_to_check)
+	ret = pool.starmap(run_domain_checks_on_domain, args, chunksize=1)
+	ret = dict(ret) # (domain, output) => { domain: output }
+	for domain in sort_domains(ret, env):
+		ret[domain].playback(output)
+
+def run_domain_checks_on_domain(domain, env, dns_domains, dns_zonefiles, mail_domains, web_domains):
+	output = BufferedOutput()
+
+	output.add_heading(domain)
+
+	if domain == env["PRIMARY_HOSTNAME"]:
+		check_primary_hostname_dns(domain, env, output, dns_domains, dns_zonefiles)
+		
+	if domain in dns_domains:
+		check_dns_zone(domain, env, output, dns_zonefiles)
+		
+	if domain in mail_domains:
+		check_mail_domain(domain, env, output)
+
+	if domain in web_domains:
+		check_web_domain(domain, env, output)
+
+	if domain in dns_domains:
+		check_dns_zone_suggestions(domain, env, output, dns_zonefiles)
+
+	return (domain, output)
+
+def check_primary_hostname_dns(domain, env, output, dns_domains, dns_zonefiles):
+	# If a DS record is set on the zone containing this domain, check DNSSEC now.
+	for zone in dns_domains:
+		if zone == domain or domain.endswith("." + zone):
+			if query_dns(zone, "DS", nxdomain=None) is not None:
+				check_dnssec(zone, env, output, dns_zonefiles, is_checking_primary=True)
+
+	# Check that the ns1/ns2 hostnames resolve to A records. This information probably
+	# comes from the TLD since the information is set at the registrar as glue records.
+	# We're probably not actually checking that here but instead checking that we, as
+	# the nameserver, are reporting the right info --- but if the glue is incorrect this
+	# will probably fail.
+	ip = query_dns("ns1." + domain, "A") + '/' + query_dns("ns2." + domain, "A")
+	if ip == env['PUBLIC_IP'] + '/' + env['PUBLIC_IP']:
+		output.print_ok("Nameserver glue records are correct at registrar. [ns1/ns2.%s => %s]" % (env['PRIMARY_HOSTNAME'], env['PUBLIC_IP']))
+	else:
+		output.print_error("""Nameserver glue records are incorrect. The ns1.%s and ns2.%s nameservers must be configured at your domain name
+			registrar as having the IP address %s. They currently report addresses of %s. It may take several hours for
+			public DNS to update after a change."""
+			% (env['PRIMARY_HOSTNAME'], env['PRIMARY_HOSTNAME'], env['PUBLIC_IP'], ip))
+
+	# Check that PRIMARY_HOSTNAME resolves to PUBLIC_IP in public DNS.
+	ip = query_dns(domain, "A")
+	if ip == env['PUBLIC_IP']:
+		output.print_ok("Domain resolves to box's IP address. [%s => %s]" % (env['PRIMARY_HOSTNAME'], env['PUBLIC_IP']))
+	else:
+		output.print_error("""This domain must resolve to your box's IP address (%s) in public DNS but it currently resolves
+			to %s. It may take several hours for public DNS to update after a change. This problem may result from other
+			issues listed here."""
+			% (env['PUBLIC_IP'], ip))
+
+	# Check reverse DNS on the PRIMARY_HOSTNAME. Note that it might not be
+	# a DNS zone if it is a subdomain of another domain we have a zone for.
+	ipaddr_rev = dns.reversename.from_address(env['PUBLIC_IP'])
+	existing_rdns = query_dns(ipaddr_rev, "PTR")
+	if existing_rdns == domain:
+		output.print_ok("Reverse DNS is set correctly at ISP. [%s => %s]" % (env['PUBLIC_IP'], env['PRIMARY_HOSTNAME']))
+	else:
+		output.print_error("""Your box's reverse DNS is currently %s, but it should be %s. Your ISP or cloud provider will have instructions
+			on setting up reverse DNS for your box at %s.""" % (existing_rdns, domain, env['PUBLIC_IP']) )
+
+	# Check the TLSA record.
+	tlsa_qname = "_25._tcp." + domain
+	tlsa25 = query_dns(tlsa_qname, "TLSA", nxdomain=None)
+	tlsa25_expected = build_tlsa_record(env)
+	if tlsa25 == tlsa25_expected:
+		output.print_ok("""The DANE TLSA record for incoming mail is correct (%s).""" % tlsa_qname,)
+	elif tlsa25 is None:
+		output.print_error("""The DANE TLSA record for incoming mail is not set. This is optional.""")
+	else:
+		output.print_error("""The DANE TLSA record for incoming mail (%s) is not correct. It is '%s' but it should be '%s'.
+			It may take several hours for public DNS to update after a change."""
+                        % (tlsa_qname, tlsa25, tlsa25_expected))
+
+	# Check that the hostmaster@ email address exists.
+	check_alias_exists("hostmaster@" + domain, env, output)
 
 def check_alias_exists(alias, env, output):
 	mail_alises = dict(get_mail_aliases(env))
@@ -222,6 +325,93 @@ def check_alias_exists(alias, env, output):
 		output.print_ok("%s exists as a mail alias [=> %s]" % (alias, mail_alises[alias]))
 	else:
 		output.print_error("""You must add a mail alias for %s and direct email to you or another administrator.""" % alias)
+
+def check_dns_zone(domain, env, output, dns_zonefiles):
+	# If a DS record is set at the registrar, check DNSSEC first because it will affect the NS query.
+	# If it is not set, we suggest it last.
+	if query_dns(domain, "DS", nxdomain=None) is not None:
+		check_dnssec(domain, env, output, dns_zonefiles)
+
+	# We provide a DNS zone for the domain. It should have NS records set up
+	# at the domain name's registrar pointing to this box. The secondary DNS
+	# server may be customized. Unfortunately this may not check the domain's
+	# whois information -- we may be getting the NS records from us rather than
+	# the TLD, and so we're not actually checking the TLD. For that we'd need
+	# to do a DNS trace.
+	custom_dns = get_custom_dns_config(env)
+	existing_ns = query_dns(domain, "NS")
+	correct_ns = "; ".join(sorted([
+		"ns1." + env['PRIMARY_HOSTNAME'],
+		custom_dns.get("_secondary_nameserver", "ns2." + env['PRIMARY_HOSTNAME']),
+		]))
+	if existing_ns.lower() == correct_ns.lower():
+		output.print_ok("Nameservers are set correctly at registrar. [%s]" % correct_ns)
+	else:
+		output.print_error("""The nameservers set on this domain are incorrect. They are currently %s. Use your domain name registrar's
+			control panel to set the nameservers to %s."""
+				% (existing_ns, correct_ns) )
+
+def check_dns_zone_suggestions(domain, env, output, dns_zonefiles):
+	# Since DNSSEC is optional, if a DS record is NOT set at the registrar suggest it.
+	# (If it was set, we did the check earlier.)
+	if query_dns(domain, "DS", nxdomain=None) is None:
+		check_dnssec(domain, env, output, dns_zonefiles)
+
+
+def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
+	# See if the domain has a DS record set at the registrar. The DS record may have
+	# several forms. We have to be prepared to check for any valid record. We've
+	# pre-generated all of the valid digests --- read them in.
+	ds_correct = open('/etc/nsd/zones/' + dns_zonefiles[domain] + '.ds').read().strip().split("\n")
+	digests = { }
+	for rr_ds in ds_correct:
+		ds_keytag, ds_alg, ds_digalg, ds_digest = rr_ds.split("\t")[4].split(" ")
+		digests[ds_digalg] = ds_digest
+
+	# Some registrars may want the public key so they can compute the digest. The DS
+	# record that we suggest using is for the KSK (and that's how the DS records were generated).
+	alg_name_map = { '7': 'RSASHA1-NSEC3-SHA1', '8': 'RSASHA256' }
+	dnssec_keys = load_env_vars_from_file(os.path.join(env['STORAGE_ROOT'], 'dns/dnssec/%s.conf' % alg_name_map[ds_alg]))
+	dnsssec_pubkey = open(os.path.join(env['STORAGE_ROOT'], 'dns/dnssec/' + dnssec_keys['KSK'] + '.key')).read().split("\t")[3].split(" ")[3]
+
+	# Query public DNS for the DS record at the registrar.
+	ds = query_dns(domain, "DS", nxdomain=None)
+	ds_looks_valid = ds and len(ds.split(" ")) == 4
+	if ds_looks_valid: ds = ds.split(" ")
+	if ds_looks_valid and ds[0] == ds_keytag and ds[1] == ds_alg and ds[3] == digests.get(ds[2]):
+		if is_checking_primary: return
+		output.print_ok("DNSSEC 'DS' record is set correctly at registrar.")
+	else:
+		if ds == None:
+			if is_checking_primary: return
+			output.print_error("""This domain's DNSSEC DS record is not set. The DS record is optional. The DS record activates DNSSEC.
+				To set a DS record, you must follow the instructions provided by your domain name registrar and provide to them this information:""")
+		else:
+			if is_checking_primary:
+				output.print_error("""The DNSSEC 'DS' record for %s is incorrect. See further details below.""" % domain)
+				return
+			output.print_error("""This domain's DNSSEC DS record is incorrect. The chain of trust is broken between the public DNS system
+				and this machine's DNS server. It may take several hours for public DNS to update after a change. If you did not recently
+				make a change, you must resolve this immediately by following the instructions provided by your domain name registrar and
+				provide to them this information:""")
+		output.print_line("")
+		output.print_line("Key Tag: " + ds_keytag + ("" if not ds_looks_valid or ds[0] == ds_keytag else " (Got '%s')" % ds[0]))
+		output.print_line("Key Flags: KSK")
+		output.print_line(
+			  ("Algorithm: %s / %s" % (ds_alg, alg_name_map[ds_alg]))
+			+ ("" if not ds_looks_valid or ds[1] == ds_alg else " (Got '%s')" % ds[1]))
+			# see http://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml
+		output.print_line("Digest Type: 2 / SHA-256")
+			# http://www.ietf.org/assignments/ds-rr-types/ds-rr-types.xml
+		output.print_line("Digest: " + digests['2'])
+		if ds_looks_valid and ds[3] != digests.get(ds[2]):
+			output.print_line("(Got digest type %s and digest %s which do not match.)" % (ds[2], ds[3]))
+		output.print_line("Public Key: ")
+		output.print_line(dnsssec_pubkey, monospace=True)
+		output.print_line("")
+		output.print_line("Bulk/Record Format:")
+		output.print_line("" + ds_correct[0])
+		output.print_line("")
 
 def check_mail_domain(domain, env, output):
 	# Check the MX record.
@@ -295,7 +485,208 @@ def check_web_domain(domain, env, output):
 				webmail or a website on this domain. The domain currently resolves to %s in public DNS. It may take several hours for
 				public DNS to update after a change. This problem may result from other issues listed here.""" % (env['PUBLIC_IP'], ip))
 
+	# We need a SSL certificate for PRIMARY_HOSTNAME because that's where the
+	# user will log in with IMAP or webmail. Any other domain we serve a
+	# website for also needs a signed certificate.
+	check_ssl_cert(domain, env, output)
+
+def query_dns(qname, rtype, nxdomain='[Not Set]'):
+	# Make the qname absolute by appending a period. Without this, dns.resolver.query
+	# will fall back a failed lookup to a second query with this machine's hostname
+	# appended. This has been causing some false-positive Spamhaus reports. The
+	# reverse DNS lookup will pass a dns.name.Name instance which is already
+	# absolute so we should not modify that.
+	if isinstance(qname, str):
+		qname += "."
+
+	# Do the query.
+	try:
+		response = dns.resolver.query(qname, rtype)
+	except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+		# Host did not have an answer for this query; not sure what the
+		# difference is between the two exceptions.
+		return nxdomain
+	except dns.exception.Timeout:
+		return "[timeout]"
+
+	# There may be multiple answers; concatenate the response. Remove trailing
+	# periods from responses since that's how qnames are encoded in DNS but is
+	# confusing for us. The order of the answers doesn't matter, so sort so we
+	# can compare to a well known order.
+	return "; ".join(sorted(str(r).rstrip('.') for r in response))
+
+def check_ssl_cert(domain, env, output):
+	# Check that SSL certificate is signed.
+
+	# Skip the check if the A record is not pointed here.
+	if query_dns(domain, "A", None) not in (env['PUBLIC_IP'], None): return
+
+	# Where is the SSL stored?
+	ssl_key, ssl_certificate, ssl_via = get_domain_ssl_files(domain, env)
+
+	if not os.path.exists(ssl_certificate):
+		output.print_error("The SSL certificate file for this domain is missing.")
+		return
+
+	# Check that the certificate is good.
+
+	cert_status, cert_status_details = check_certificate(domain, ssl_certificate, ssl_key)
+
+	if cert_status == "OK":
+		# The certificate is ok. The details has expiry info.
+		output.print_ok("SSL certificate is signed & valid. %s %s" % (ssl_via if ssl_via else "", cert_status_details))
+
+	elif cert_status == "SELF-SIGNED":
+		# Offer instructions for purchasing a signed certificate.
+
+		fingerprint = shell('check_output', [
+			"openssl",
+			"x509",
+			"-in", ssl_certificate,
+			"-noout",
+			"-fingerprint"
+			])
+		fingerprint = re.sub(".*Fingerprint=", "", fingerprint).strip()
+
+		if domain == env['PRIMARY_HOSTNAME']:
+			output.print_error("""The SSL certificate for this domain is currently self-signed. You will get a security
+			warning when you check or send email and when visiting this domain in a web browser (for webmail or
+			static site hosting). Use the SSL Certificates page in this control panel to install a signed SSL certificate.
+			You may choose to leave the self-signed certificate in place and confirm the security exception, but check that
+			the certificate fingerprint matches the following:""")
+			output.print_line("")
+			output.print_line("   " + fingerprint, monospace=True)
+		else:
+			output.print_warning("""The SSL certificate for this domain is currently self-signed. Visitors to a website on
+			this domain will get a security warning. If you are not serving a website on this domain, then it is
+			safe to leave the self-signed certificate in place. Use the SSL Certificates page in this control panel to
+			install a signed SSL certificate.""")
+
+	else:
+		output.print_error("The SSL certificate has a problem: " + cert_status)
+		if cert_status_details:
+			output.print_line("")
+			output.print_line(cert_status_details)
+			output.print_line("")
+
+def check_certificate(domain, ssl_certificate, ssl_private_key):
+	# Use openssl verify to check the status of a certificate.
+
+	# First check that the certificate is for the right domain. The domain
+	# must be found in the Subject Common Name (CN) or be one of the
+	# Subject Alternative Names. A wildcard might also appear as the CN
+	# or in the SAN list, so check for that tool.
+	retcode, cert_dump = shell('check_output', [
+		"openssl", "x509",
+		"-in", ssl_certificate,
+		"-noout", "-text", "-nameopt", "rfc2253",
+		], trap=True)
+
+	# If the certificate is catastrophically bad, catch that now and report it.
+	# More information was probably written to stderr (which we aren't capturing),
+	# but it is probably not helpful to the user anyway.
+	if retcode != 0:
+		return ("The SSL certificate appears to be corrupted or not a PEM-formatted SSL certificate file. (%s)" % ssl_certificate, None)
+
+	cert_dump = cert_dump.split("\n")
+	certificate_names = set()
+	cert_expiration_date = None
+	while len(cert_dump) > 0:
+		line = cert_dump.pop(0)
+
+		# Grab from the Subject Common Name. We include the indentation
+		# at the start of the line in case maybe the cert includes the
+		# common name of some other referenced entity (which would be
+		# indented, I hope).
+		m = re.match("        Subject: CN=([^,]+)", line)
+		if m:
+			certificate_names.add(m.group(1))
 	
+		# Grab from the Subject Alternative Name, which is a comma-delim
+		# list of names, like DNS:mydomain.com, DNS:otherdomain.com.
+		m = re.match("            X509v3 Subject Alternative Name:", line)
+		if m:
+			names = re.split(",\s*", cert_dump.pop(0).strip())
+			for n in names:
+				m = re.match("DNS:(.*)", n)
+				if m:
+					certificate_names.add(m.group(1))
+
+		m = re.match("            Not After : (.*)", line)
+		if m:
+			cert_expiration_date = dateutil.parser.parse(m.group(1))
+
+	domain = domain.encode("idna").decode("ascii")
+	wildcard_domain = re.sub("^[^\.]+", "*", domain)
+	if domain is not None and domain not in certificate_names and wildcard_domain not in certificate_names:
+		return ("The certificate is for the wrong domain name. It is for %s."
+			% ", ".join(sorted(certificate_names)), None)
+
+	# Second, check that the certificate matches the private key. Get the modulus of the
+	# private key and of the public key in the certificate. They should match. The output
+	# of each command looks like "Modulus=XXXXX".
+	if ssl_private_key is not None:
+		private_key_modulus = shell('check_output', [
+			"openssl", "rsa",
+			"-inform", "PEM",
+			"-noout", "-modulus",
+			"-in", ssl_private_key])
+		cert_key_modulus = shell('check_output', [
+			"openssl", "x509",
+			"-in", ssl_certificate,
+			"-noout", "-modulus"])
+		if private_key_modulus != cert_key_modulus:
+			return ("The certificate installed at %s does not correspond to the private key at %s." % (ssl_certificate, ssl_private_key), None)
+
+	# Next validate that the certificate is valid. This checks whether the certificate
+	# is self-signed, that the chain of trust makes sense, that it is signed by a CA
+	# that Ubuntu has installed on this machine's list of CAs, and I think that it hasn't
+	# expired.
+
+	# In order to verify with openssl, we need to split out any
+	# intermediary certificates in the chain (if any) from our
+	# certificate (at the top). They need to be passed separately.
+
+	cert = open(ssl_certificate).read()
+	m = re.match(r'(-*BEGIN CERTIFICATE-*.*?-*END CERTIFICATE-*)(.*)', cert, re.S)
+	if m == None:
+		return ("The certificate file is an invalid PEM certificate.", None)
+	mycert, chaincerts = m.groups()
+
+	# This command returns a non-zero exit status in most cases, so trap errors.
+
+	retcode, verifyoutput = shell('check_output', [
+		"openssl",
+		"verify", "-verbose",
+		"-purpose", "sslserver", "-policy_check",]
+		+ ([] if chaincerts.strip() == "" else ["-untrusted", "/dev/stdin"])
+		+ [ssl_certificate],
+		input=chaincerts.encode('ascii'),
+		trap=True)
+
+	if "self signed" in verifyoutput:
+		# Certificate is self-signed.
+		return ("SELF-SIGNED", None)
+	elif retcode != 0:
+		if "unable to get local issuer certificate" in verifyoutput:
+			return ("The certificate is missing an intermediate chain or the intermediate chain is incorrect or incomplete. (%s)" % verifyoutput, None)
+
+		# There is some unknown problem. Return the `openssl verify` raw output.
+		return ("There is a problem with the SSL certificate.", verifyoutput.strip())
+	else:
+		# `openssl verify` returned a zero exit status so the cert is currently
+		# good.
+
+		# But is it expiring soon?
+		now = datetime.datetime.now(dateutil.tz.tzlocal())
+		ndays = (cert_expiration_date-now).days
+		expiry_info = "The certificate expires in %d days on %s." % (ndays, cert_expiration_date.strftime("%x"))
+		if ndays <= 31:
+			return ("The certificate is expiring soon: " + expiry_info, None)
+
+		# Return the special OK code.
+		return ("OK", expiry_info)
+
 _apt_updates = None
 def list_apt_updates(apt_update=True):
 	# See if we have this information cached recently.
