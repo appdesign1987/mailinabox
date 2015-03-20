@@ -45,10 +45,6 @@ tools/editconf.py /etc/php5/fpm/pool.d/www.conf -c ';' \
 # The format of the file is documented at:
 # https://wiki.mozilla.org/Thunderbird:Autoconfiguration:ConfigFileFormat
 # and https://developer.mozilla.org/en-US/docs/Mozilla/Thunderbird/Autoconfiguration/FileFormat/HowTo.
-cat conf/mozilla-autoconfig.xml \
-	| sed "s/PRIMARY_HOSTNAME/$PRIMARY_HOSTNAME/" \
-	 > /var/lib/mailinabox/mozilla-autoconfig.xml
-chmod a+r /var/lib/mailinabox/mozilla-autoconfig.xml
 
 # make a default homepage
 if [ -d $STORAGE_ROOT/www/static ]; then mv $STORAGE_ROOT/www/static $STORAGE_ROOT/www/default; fi # migration #NODOC
